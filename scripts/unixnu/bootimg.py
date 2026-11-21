@@ -5,8 +5,8 @@ the built firmware volume and a compiled device tree. The image is meant for boo
 bootloader.
 
 The packer supports the legacy v0-v2 layout and the v3/v4 layout. v4 is used by devices whose
-bootloader accepts the Android boot image v4 header. A board may ask for the Diting PONGFAT1
-ramdisk envelope, which wraps the FAT payload without changing the FAT payload artifact itself.
+bootloader accepts the Android boot image v4 header. The ramdisk is written unchanged; a device
+that needs a wrapper around its FAT payload should add an explicit, documented board hook.
 """
 import gzip
 import hashlib
@@ -22,7 +22,6 @@ from .util import Error, log, run, sha256_file, tool
 
 DEFAULTS = {'header_version': 0, 'base': 0, 'kernel_offset': 0x8000, 'tags_offset': 0x1e00000, 'pagesize': 4096}
 MKBOOTIMG_FLAGS = ('base', 'kernel_offset', 'tags_offset', 'pagesize', 'header_version', 'ramdisk_offset', 'second_offset', 'cmdline')
-MAGIC = b'PONGFAT1'
 
 
 def compile_shim(uefi, base, size, requires_header, scratch):
@@ -73,24 +72,6 @@ def settings(ctx, uefi):
     return values, fd.get('base'), fd.get('size'), config.get('boot_shim', {}).get('requires_kernel_header', True), config
 
 
-def envelope_pongfat1(fat):
-    """Wrap a FAT payload in the PONGFAT1 header DitingBootMemoryDxe expects.
-
-    The exact layout is the one scripts/finalize-diting-adt.py writes: 4096-byte header,
-    magic/version/header length/u64 volume length/CRC32 of the FAT, then the FAT unchanged.
-    """
-    if not fat or len(fat) % 512 or fat[510:512] != b'\x55\xaa':
-        raise Error('cannot PONGFAT1-wrap a ramdisk that is not a 512-byte-sector FAT volume')
-    if struct.unpack_from('<H', fat, 11)[0] != 512:
-        raise Error('cannot PONGFAT1-wrap a FAT volume whose sector size is not 512')
-    sectors = struct.unpack_from('<H', fat, 19)[0] or struct.unpack_from('<I', fat, 32)[0]
-    if sectors != len(fat) // 512:
-        raise Error(f'the FAT volume declares {sectors} sectors, it holds {len(fat) // 512}')
-    header = bytearray(4096)
-    struct.pack_into('<8sIIQII', header, 0, MAGIC, 1, 4096, len(fat), zlib.crc32(fat) & 0xffffffff, 0)
-    return bytes(header) + fat
-
-
 def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
     log('bootimg')
     image, base, size, requires_header, config = settings(ctx, uefi)
@@ -124,12 +105,6 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
             ramdisk_path = Path(ramdisk)
             if not ramdisk_path.is_file():
                 raise Error(f'ramdisk not found: {ramdisk_path}')
-            if image.get('ramdisk_envelope') == 'PONGFAT1':
-                payload = ramdisk_path.read_bytes()
-                if not payload.startswith(MAGIC):
-                    payload = envelope_pongfat1(payload)
-                ramdisk_path = scratch / 'ramdisk-pongfat1'
-                ramdisk_path.write_bytes(payload)
         else:
             ramdisk_path = scratch / 'ramdisk'
             ramdisk_path.write_bytes(b'')

@@ -140,7 +140,6 @@ kernel_args = ["-v", "serial=3", "debug=0x14e"]
 | `tags_offset` | 整数 | tags 偏移 |
 | `pagesize` | 整数 | 镜像页大小 |
 | `header_version` | 整数 | Android 启动镜像 header 版本 |
-| `ramdisk_envelope` | 字符串 | 打包前包装 FAT ramdisk；`PONGFAT1` 写入 4096 字节 Diting envelope，仅用于 v3/v4 镜像。 |
 
 ### [[bootimg.dtb_node]]
 
