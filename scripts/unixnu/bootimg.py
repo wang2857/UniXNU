@@ -1,8 +1,12 @@
 """Android boot image: gzip(BootShim + UEFI FD) with the device tree appended, plus an optional ramdisk.
 
 Inputs are a Mu-Silicium checkout (BootShim sources, Resources/Configs/<device>.toml, mkbootimg.py),
-the built firmware volume and a compiled device tree. The image is meant for "fastboot boot" only.
-The result is verified by unpacking it again; the output is deterministic.
+the built firmware volume and a compiled device tree. The image is meant for booting by the stock
+bootloader.
+
+The packer supports the legacy v0-v2 layout and the v3/v4 layout. v4 is used by devices whose
+bootloader accepts the Android boot image v4 header. A board may ask for the Diting PONGFAT1
+ramdisk envelope, which wraps the FAT payload without changing the FAT payload artifact itself.
 """
 import gzip
 import hashlib
@@ -18,6 +22,7 @@ from .util import Error, log, run, sha256_file, tool
 
 DEFAULTS = {'header_version': 0, 'base': 0, 'kernel_offset': 0x8000, 'tags_offset': 0x1e00000, 'pagesize': 4096}
 MKBOOTIMG_FLAGS = ('base', 'kernel_offset', 'tags_offset', 'pagesize', 'header_version', 'ramdisk_offset', 'second_offset', 'cmdline')
+MAGIC = b'PONGFAT1'
 
 
 def compile_shim(uefi, base, size, requires_header, scratch):
@@ -68,6 +73,24 @@ def settings(ctx, uefi):
     return values, fd.get('base'), fd.get('size'), config.get('boot_shim', {}).get('requires_kernel_header', True), config
 
 
+def envelope_pongfat1(fat):
+    """Wrap a FAT payload in the PONGFAT1 header DitingBootMemoryDxe expects.
+
+    The exact layout is the one scripts/finalize-diting-adt.py writes: 4096-byte header,
+    magic/version/header length/u64 volume length/CRC32 of the FAT, then the FAT unchanged.
+    """
+    if not fat or len(fat) % 512 or fat[510:512] != b'\x55\xaa':
+        raise Error('cannot PONGFAT1-wrap a ramdisk that is not a 512-byte-sector FAT volume')
+    if struct.unpack_from('<H', fat, 11)[0] != 512:
+        raise Error('cannot PONGFAT1-wrap a FAT volume whose sector size is not 512')
+    sectors = struct.unpack_from('<H', fat, 19)[0] or struct.unpack_from('<I', fat, 32)[0]
+    if sectors != len(fat) // 512:
+        raise Error(f'the FAT volume declares {sectors} sectors, it holds {len(fat) // 512}')
+    header = bytearray(4096)
+    struct.pack_into('<8sIIQII', header, 0, MAGIC, 1, 4096, len(fat), zlib.crc32(fat) & 0xffffffff, 0)
+    return bytes(header) + fat
+
+
 def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
     log('bootimg')
     image, base, size, requires_header, config = settings(ctx, uefi)
@@ -86,6 +109,7 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
         raise Error(f'firmware volume is {len(firmware):#x} bytes, the device config says {size:#x}')
     out = Path(output) if output else ctx.work / 'boot/boot.img'
     out.parent.mkdir(parents=True, exist_ok=True)
+    version = int(image.get('header_version', 0))
     with tempfile.TemporaryDirectory(prefix='unixnu-bootimg-') as scratch_name:
         scratch = Path(scratch_name)
         shim = compile_shim(uefi, base, size, requires_header, scratch)
@@ -100,28 +124,81 @@ def build(ctx, uefi, fd, dtb, ramdisk=None, output=None):
             ramdisk_path = Path(ramdisk)
             if not ramdisk_path.is_file():
                 raise Error(f'ramdisk not found: {ramdisk_path}')
+            if image.get('ramdisk_envelope') == 'PONGFAT1':
+                payload = ramdisk_path.read_bytes()
+                if not payload.startswith(MAGIC):
+                    payload = envelope_pongfat1(payload)
+                ramdisk_path = scratch / 'ramdisk-pongfat1'
+                ramdisk_path.write_bytes(payload)
         else:
             ramdisk_path = scratch / 'ramdisk'
             ramdisk_path.write_bytes(b'')
         command = ['python3', mkbootimg, '--kernel', kernel_path, '--ramdisk', ramdisk_path, '-o', out]
-        for key in MKBOOTIMG_FLAGS:
-            if key in image:
-                command += [f'--{key}', str(image[key])]
+        if version >= 3:
+            command += ['--header_version', str(version)]
+        else:
+            for key in MKBOOTIMG_FLAGS:
+                if key in image:
+                    command += [f'--{key}', str(image[key])]
         run(command, capture=True)
         report = verify(out, combined, tree, ramdisk_path, image)
     report.update(image_sha256=sha256_file(out), image_bytes=out.stat().st_size, fd_sha256=sha256_file(fd),
-                  dtb_sha256=sha256_file(dtb), shim_bytes=len(shim), hardware_tested=False)
+                  dtb_sha256=sha256_file(dtb), shim_bytes=len(shim), hardware_tested=False,
+                  ramdisk_envelope=image.get('ramdisk_envelope'))
     (out.parent / 'boot.json').write_text(json.dumps(report, indent=2) + '\n')
     log(f'bootimg: {out} ({out.stat().st_size} bytes)')
     return out
 
 
 def verify(path, combined, tree, ramdisk_path, image):
-    """Unpack the image and compare every part with its input."""
+    """Unpack the image and compare every part with its input. Supports v0-v2 and v3/v4."""
     data = Path(path).read_bytes()
-    kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, page, version, _ = struct.unpack_from('<10I', data, 8)
-    if data[:8] != b'ANDROID!' or second_size or version != image['header_version'] or page != image['pagesize']:
-        raise Error('boot image header does not match the requested parameters')
+    if len(data) < 4096 or data[:8] != b'ANDROID!':
+        raise Error('boot image has no Android boot header')
+    version = struct.unpack_from('<I', data, 40)[0]
+    requested = int(image.get('header_version', 0))
+    if version != requested:
+        raise Error(f'boot image header version {version} differs from requested {requested}')
+    page = int(image.get('pagesize', 4096))
+    ramdisk = Path(ramdisk_path).read_bytes()
+    if version in (3, 4):
+        if page != 4096:
+            raise Error('v3/v4 boot images require a 4096-byte page')
+        kernel_size, ramdisk_size, _, header_size = struct.unpack_from('<4I', data, 8)
+        expected_header = 1584 if version == 4 else 1580
+        if header_size != expected_header:
+            raise Error(f'v{version} header size {header_size} != {expected_header}')
+        kernel_start = 4096
+        kernel = data[kernel_start:kernel_start + kernel_size]
+        if len(kernel) != kernel_size:
+            raise Error('truncated kernel area')
+        unpacker = zlib.decompressobj(16 + zlib.MAX_WBITS)
+        if unpacker.decompress(kernel) != combined or not unpacker.eof or unpacker.unused_data != tree:
+            raise Error('gzip, firmware and appended device tree do not round-trip')
+        ramdisk_start = kernel_start + ((kernel_size + 4095) // 4096) * 4096
+        if data[ramdisk_start:ramdisk_start + ramdisk_size] != ramdisk:
+            raise Error('ramdisk bytes differ')
+        signature = 0
+        if version == 4:
+            signature = struct.unpack_from('<I', data, 1580)[0]
+            signature_start = ramdisk_start + ((ramdisk_size + 4095) // 4096) * 4096
+            if signature not in (0, 4096):
+                raise Error(f'unexpected v4 signature size {signature}')
+            if len(data) != signature_start + signature:
+                raise Error('unexpected v4 image tail length')
+            if signature and any(data[signature_start:]):
+                raise Error('expected a zero-filled unsigned signature area')
+        elif len(data) != ramdisk_start + ((ramdisk_size + 4095) // 4096) * 4096:
+            raise Error('unexpected v3 image tail length')
+        return {'header_version': version, 'page_size': page, 'kernel_bytes': kernel_size,
+                'ramdisk_bytes': ramdisk_size, 'signature_bytes': signature,
+                'kernel_sha256': hashlib.sha256(kernel).hexdigest()}
+
+    # Legacy v0-v2.
+    kernel_size, kernel_address, ramdisk_size, _, second_size, _, tags, pagesize, version, _ = \
+        struct.unpack_from('<10I', data, 8)
+    if second_size or pagesize != page:
+        raise Error('legacy boot image header does not match the requested parameters')
     if kernel_address != image['base'] + image['kernel_offset'] or tags != image['base'] + image['tags_offset']:
         raise Error('boot image load addresses do not match the requested offsets')
     kernel = data[page:page + kernel_size]
@@ -129,7 +206,7 @@ def verify(path, combined, tree, ramdisk_path, image):
     if unpacker.decompress(kernel) != combined or not unpacker.eof or unpacker.unused_data != tree:
         raise Error('gzip, firmware and appended device tree do not round-trip')
     start = page * (1 + -(-kernel_size // page))
-    if data[start:start + ramdisk_size] != Path(ramdisk_path).read_bytes():
+    if data[start:start + ramdisk_size] != ramdisk:
         raise Error('ramdisk bytes differ')
     return {'kernel_sha256': hashlib.sha256(kernel).hexdigest(), 'ramdisk_bytes': ramdisk_size,
             'header_version': version, 'kernel_address': hex(kernel_address), 'tags_address': hex(tags)}
