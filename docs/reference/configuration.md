@@ -141,6 +141,7 @@ The selected defconfig applies after `config_fragments`. File prefixes are
 | `tags_offset` | integer | Tags offset |
 | `pagesize` | integer | Image page size |
 | `header_version` | integer | Android boot image header version |
+| `ramdisk_envelope` | string | Wrap the FAT ramdisk before packing. `PONGFAT1` writes the 4096-byte Diting envelope; applies to v3/v4 images. |
 
 ### [[bootimg.dtb_node]]
 
