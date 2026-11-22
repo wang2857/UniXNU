@@ -27,15 +27,46 @@ def paths(ctx):
     return out, out / 'payload.img', out / 'payload.json'
 
 
+def begin_build(ctx):
+    out = paths(ctx)[0]
+    out.mkdir(parents=True, exist_ok=True)
+    (out / '.build-pending').write_text('The latest payload build has not completed\n')
+
+
+def finish_build(ctx):
+    (paths(ctx)[0] / '.build-pending').unlink(missing_ok=True)
+
+
+def require_complete(ctx):
+    if (paths(ctx)[0] / '.build-pending').exists():
+        raise Error('the latest payload build did not complete; rerun unixnu build payload successfully before bootimg')
+
+
 def check_args(arguments):
     for value in arguments:
-        if not re.fullmatch(r'[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,/\-]+)?', value):
+        # A value may hold ':' and '=' (exec-env=NAME:VAR=VALUE); no space, quote or shell character.
+        if not re.fullmatch(r'[A-Za-z0-9_.\-]+(=[A-Za-z0-9_.,/\-:=]+)?', value):
             raise Error(f'unsupported kernel argument: {value}')
     line = ' '.join(arguments)
     # DarwinBoot copies the command line into a 1024-byte buffer and refuses a longer one.
     if len(line) > 1000:
         raise Error(f'the kernel command line is {len(line)} bytes; the limit is 1000')
     return line
+
+
+def check_data_input(ctx, data):
+    """An owner-Data kernel needs a seed even when it resumes a persistent overlay."""
+    if data:
+        return
+    from .config import parse_config
+    config = ctx.config
+    if not ctx.config_path.is_file() and ctx.config_name:
+        selected = ctx.device / 'configs' / ctx.config_name
+        if selected.is_file():
+            config = parse_config(selected.read_text())
+    if config.get('XNU_OWNER_DATA_MOUNT'):
+        raise Error('CONFIG_XNU_OWNER_DATA_MOUNT requires --data-ramdisk FILE (or [build] data_ramdisk); '
+                    'persistent Data still needs its original seed to publish the volume')
 
 
 def check_native_root(kernel, arguments, vmm_present=False):
@@ -51,22 +82,33 @@ def check_native_root(kernel, arguments, vmm_present=False):
             values.setdefault(key, []).append(value)
     if '1' not in values.get('native-ufs-root', []):
         return
-    if values.get('sheng-pmgr') != ['2']:
-        raise Error('native UFS root boot needs exactly one sheng-pmgr=2; the unchanged target AMFI otherwise panics with No PMGR')
+    if values.get('pmgr') != ['2']:
+        raise Error('native UFS root boot needs exactly one pmgr=2; the unchanged target AMFI otherwise panics with No PMGR')
     symbols = run([tool('llvm-nm', 'brew install llvm'), '--defined-only', kernel], capture=True)
     if not any(line.split()[-1:] == ['_sheng_pmgr_run'] for line in symbols.splitlines()):
         raise Error('the native UFS root kernel lacks the linked sheng PMGR integration')
 
 
 def write_volume(stage, image, label, size_mib):
+    """Publish only a FAT volume whose complete file set was accepted by mtools."""
     for tool_name in ('mformat', 'mcopy'):
         tool(tool_name, 'brew install mtools')
-    image.unlink(missing_ok=True)
+    if size_mib < 1:
+        raise Error('payload size_mib must be positive')
+    image.parent.mkdir(parents=True, exist_ok=True)
     env = dict(os.environ, MTOOLS_SKIP_CHECK='1', TZ='UTC')
     sectors = size_mib * 2048
-    run(['mformat', '-C', '-F', '-T', str(sectors), '-v', label, '-N', '53484e47', '-i', image, '::'], env=env, capture=True)
-    for entry in sorted(stage.iterdir()):
-        run(['mcopy', '-i', image, '-s', '-Q', '-m', entry, '::/'], env=env, capture=True)
+    # Cluster rounding, long filenames and FAT metadata are accounted for by
+    # mtools. A percentage of logical file sizes is not a filesystem limit.
+    with tempfile.TemporaryDirectory(prefix='.payload-', dir=image.parent) as scratch:
+        candidate = Path(scratch) / image.name
+        run(['mformat', '-C', '-F', '-T', str(sectors), '-v', label, '-N', '53484e47', '-i', candidate, '::'], env=env, capture=True)
+        try:
+            for entry in sorted(stage.iterdir()):
+                run(['mcopy', '-i', candidate, '-s', '-Q', '-m', entry, '::/'], env=env, capture=True)
+        except Error as error:
+            raise Error(f'cannot populate the {size_mib} MiB payload FAT volume; previous image retained: {error}') from error
+        candidate.replace(image)
 
 
 def skip_setup_seed(ctx, base, tool_path, tool_args=()):
@@ -96,9 +138,10 @@ def build(ctx, kernel=None):
     if not kernel.is_file():
         raise Error(f'kernel not found: {kernel}; run "unixnu build kernel" or pass --kernel FILE')
     extra = list(getattr(args, 'kernel_arg', None) or [])
-    # An extra NAME=VALUE replaces the board's argument of the same name.
+    # An extra NAME=VALUE replaces the board's argument of the same name. The extra arguments come first: a run's own switches
+    # (autoreset above all, which brings an unattended run back to fastboot) are the last to go if the line is ever cut short.
     names = {item.split('=', 1)[0] for item in extra}
-    arguments = [item for item in spec.get('kernel_args', []) if item.split('=', 1)[0] not in names] + extra
+    arguments = extra + [item for item in spec.get('kernel_args', []) if item.split('=', 1)[0] not in names]
     line = check_args(arguments)
     log(f'kernel args: {line}')
     check_native_root(kernel, arguments, bool(ctx.board.get('adt', {}).get('defaults', {}).get('u32', {}).get('vmm-present')))
@@ -111,6 +154,7 @@ def build(ctx, kernel=None):
         if allowed and not owner_trust and sha256_file(trust) not in allowed:
             raise Error(f'{trust} is not one of the trust caches this board accepts (board.toml [payload] trust_cache_sha256)')
     data = expand(args.data_ramdisk) if getattr(args, 'data_ramdisk', None) else None
+    check_data_input(ctx, data)
     if data and not data.is_file():
         raise Error(f'Data ramdisk not found: {data}')
     if getattr(args, 'skip_setup', False):
@@ -229,7 +273,7 @@ def build(ctx, kernel=None):
         os.utime(path, (EPOCH, EPOCH))
     size = int(spec.get('size_mib', 192))
     content = sum(p.stat().st_size for p in stage.rglob('*') if p.is_file())
-    if content > size * 1024 * 1024 * 0.95:
+    if content > size * 1024 * 1024:
         raise Error(f'the payload files take {content >> 20} MiB; raise size_mib (now {size}) in board.toml [payload]')
     write_volume(stage, image, spec.get('volume', 'UNIXNU')[:11], size)
     data_report = {'kernel_sha256': sha256_file(kernel), 'payload_kernel_sha256': sha256_file(payloads / 'kernel.macho'),
