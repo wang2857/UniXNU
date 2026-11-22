@@ -79,7 +79,8 @@ def main():
     tree, device = args.tree.resolve(), args.device.resolve()
     if args.profile is None:
         board = tomllib.loads((device / 'board.toml').read_text())
-        args.profile = ROOT / 'profiles/os' / board['board']['os_profile'] / 'profile.toml'
+        core = (device / board['package']['unixnu']).resolve()
+        args.profile = Path(os.environ['UNIXNU_OS_PROFILE']) if os.environ.get('UNIXNU_OS_PROFILE') else core / 'profiles/os' / board['board']['os_profile'] / 'profile.toml'
     profile = tomllib.loads(args.profile.read_text())
     pins = {entry['name']: entry for entry in profile.get('source', [])}
     for family in ('IOStorageFamily', 'IOHIDFamily'):
@@ -132,9 +133,11 @@ def main():
     if not data:
         raise SystemExit(f'{firmware}: empty touch firmware')
     firmware_source = out / 'NvtFirmware.c'
+    # The macOS collection has no room for the image in the kernel's __TEXT or __DATA_CONST; __DATA has room.
+    placement = '__attribute__((section("__DATA,__firmware"))) ' if os.environ.get('UNIXNU_XNU_TARGET') == 'macosx' else ''
     firmware_source.write_text('/* Generated vendor firmware; build output only. */\n#include <stdint.h>\n'
                                f'const uint32_t native_touch_firmware_size = {len(data)};\n'
-                               f'const uint8_t native_touch_firmware[{len(data)}] = {{' +
+                               f'{placement}const uint8_t native_touch_firmware[{len(data)}] = {{' +
                                ','.join(str(value) for value in data) + '};\n')
     components = {
         'ShengUfs': [(device / 'drivers/ShengUfs/NativeUfs.cpp', [

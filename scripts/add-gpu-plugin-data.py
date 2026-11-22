@@ -7,7 +7,7 @@ With --publish the seed also carries /private/var/ngpu/addons/NativeAdrenoMetal.
 discovery in backboardd (NativeAdrenoMetalPlugin.mm), so the render server composites through it. Without the file the plugin only runs its tests.
 
 Adds /private/var/ngpu/addons/NativeAdrenoMetal.bundle, /private/var/ngpu/bin/adrenoprobed and /private/var/ngpu/daemons/*.plist (from build/adreno-metal-plugin, see build-adreno-metal-plugin.py). The
-kernel's boot-time addon mount (sheng-gpu-addon=1) presents that directory as a read-only union view over
+kernel's boot-time addon mount (gpu-addon=1) presents that directory as a read-only union view over
 /System/Library/Extensions, which is where the original Metal discovery looks for MetalPluginName. BASE is not modified and the
 volume UUID is unchanged. Nothing is written to Git or to the OS inputs."""
 import json
@@ -38,7 +38,8 @@ def main():
         sys.exit('Build the plugin first: python3 scripts/build-adreno-metal-plugin.py')
     blob = base.read_bytes()
     logical, extents = packed_ramdisk.regions(blob)
-    with tempfile.TemporaryDirectory(prefix='data-seed-', dir=str(ROOT / 'build')) as td:
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='data-seed-', dir=output.parent) as td:
         raw = Path(td) / 'seed.raw'
         with raw.open('wb') as f:
             f.truncate(logical)

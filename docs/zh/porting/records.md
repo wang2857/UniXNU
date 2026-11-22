@@ -26,6 +26,7 @@
 | 输入 | 总线、传感器协议、引脚、中断、固件、触点 ID 和坐标映射 |
 | GPU | GPU/GMU 型号、固件、电源请求、SMMU、提交、fence、前端 ABI 和呈现 |
 | 网络 | 总线、固件、中断、DMA、OS 接口、连接和数据包传输 |
+| 蜂窝网络 | modem 固件与 EFS/NV、QRTR/QMI、SIM 身份、网络注册、IPA/QMAP、数据会话和复位；没有基带的设备填 `not-applicable` |
 | 音频 | DSP、codec、时钟、固件服务、路由和播放/录音 |
 | 电源 | 稳压器、时钟、电池单位、固件所有权和支持的状态转换 |
 | 镜像组装 | XNU/IPSW 版本、ABI 输入、补丁顺序、ADT、payload 和启动镜像格式 |
@@ -37,7 +38,8 @@
 ## 记录格式
 
 复制 `examples/device/porting.toml`。设备名称、SoC 和 OS 配置必须与 `board.toml`
-一致。每个 `[[area]]` 包含以下字段：
+一致。服务多个 OS 配置的板子只保留一份记录，身份使用默认配置；其他配置（例如 macOS）
+的结果写入相同的范围，并写明该配置和构建号。每个 `[[area]]` 包含以下字段：
 
 | 字段 | 内容 |
 | --- | --- |
@@ -80,16 +82,16 @@
 3. 修改实现，并更新各受影响部分的经验或证据。
 4. 接口变化时同步更新配置、步骤和完成条件。
 5. 运行记录检查和实现已有的相关检查。
-6. 代码和文档分别提交，放在同一个 pull request 中。
+6. 按仓库流程发布代码和文档。单独发布的记录包含其验证源码版本对应的主机或设备证据。
 7. 发布设备改动，由目录工作流更新源码版本和生成页面。
 
 ```sh
-python3 scripts/porting-record.py check --device ../UniXNU-sheng
-python3 scripts/porting-record.py check --device ../UniXNU-sheng --base origin/main
+python3 scripts/porting-record.py check --device /path/to/device
+python3 scripts/porting-record.py check --device /path/to/device --base origin/main
 ```
 
 第二条命令在待提交的设备分支上运行，比较已提交改动与基准版本。每个代码路径
-需要归属部分，每个匹配部分需要更新经验或证据。Markdown 改动按文档流程审阅。
+需要归属部分。每个匹配部分需要更新经验或证据，或引用祖先版本的已发布验证，且其涉及的源码与待提交分支一致。Markdown 改动按文档流程审阅。
 `porting.toml` 是设备记录的权威来源。
 
 设备模板包含 `.github/workflows/porting-record.yml`。官方设备分支要求其
@@ -132,7 +134,7 @@ npm --prefix docs run build
 本地预览：
 
 ```sh
-python3 scripts/porting-record.py site --local sheng=../UniXNU-sheng
+python3 scripts/porting-record.py site --local myboard=/path/to/device
 cd docs
 npx vitepress build
 ```

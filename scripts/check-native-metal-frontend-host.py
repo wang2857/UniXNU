@@ -5,6 +5,7 @@ Builds the bridge for the host, the frontend and its public-API test (bridge/fro
 as the runtime's loader: MoltenVK (brew install molten-vk) on this Mac. That is an offline instrument for the frontend's and the runtime's
 behaviour; it says nothing of Turnip, the Adreno 740 or its SMMU. With the target's QuartzCore library on a local mount (never committed) the
 test also translates it. The frontend is cross-compiled for arm64-apple-ios17.0 as well. Output stays under build/adreno-metal-frontend-host."""
+import argparse
 import os
 from pathlib import Path
 import subprocess
@@ -12,13 +13,19 @@ import sys
 import tempfile
 
 ROOT = Path(__file__).resolve().parents[1]
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument('--translator-source', type=Path, help='use the pinned translator checkout and its existing Cargo cache')
+options = parser.parse_args()
 OUT = ROOT / 'build/adreno-metal-frontend-host'
 KIT = ROOT / 'drivers/AdrenoMetal'
 QUARTZCORE = ROOT / '.cache/firmware/target-volumes/os-mount/System/Library/Frameworks/QuartzCore.framework/default.metallib'
 loader = next((p for p in [os.environ.get('NMB_HOST_LOADER', ''), '/opt/homebrew/lib/libMoltenVK.dylib'] if p and Path(p).is_file()), None)
 if not loader:
     raise SystemExit('A host Vulkan driver is required (brew install molten-vk, or NMB_HOST_LOADER)')
-subprocess.run([sys.executable, ROOT / 'scripts/build-adreno-metal-bridge.py', '--target', 'host'], check=True)
+bridge_command = [sys.executable, ROOT / 'scripts/build-adreno-metal-bridge.py', '--target', 'host']
+if options.translator_source:
+    bridge_command += ['--source', options.translator_source.resolve()]
+subprocess.run(bridge_command, check=True)
 OUT.mkdir(parents=True, exist_ok=True)
 flags = ['-std=c++17', '-fobjc-arc', '-O1', '-Wall', '-Wextra', '-Werror', '-Wno-unused-parameter', '-Wno-deprecated-declarations', '-I', KIT]
 test = OUT / 'frontend_host'
@@ -37,11 +44,30 @@ lines = [l for l in result.stdout.splitlines() if l.startswith(('PASS', 'FAIL', 
 print('\n'.join(lines))
 if result.returncode or not any(l.startswith('PASS') for l in lines):
     sys.exit('native Metal frontend host check failed (exit %d); see %s' % (result.returncode, OUT / 'frontend_host.log'))
+priority_test = OUT / 'queue_priority_host'
+subprocess.run(['xcrun', 'clang++', '-std=c++17', '-Wall', '-Wextra', '-Werror',
+                KIT / 'bridge/queue_priority_host.cpp', '-o', priority_test], check=True)
+subprocess.run([priority_test], check=True)
+# Interface and single-sample behavior must preserve rendered pixels and queue completion.
+interfaces = OUT / 'interfaces_host'
+subprocess.run(['xcrun', 'clang++', *flags, KIT / 'NativeBridgeMetalFrontend.mm', KIT / 'bridge/interface_regressions_host.mm',
+                ROOT / 'build/adreno-metal-bridge/host/libadreno_metal_bridge.a', '-framework', 'Foundation', '-framework', 'Metal',
+                '-framework', 'IOSurface', '-o', interfaces], check=True)
+for mode in ['normal', 'single', 'default']:
+    with tempfile.TemporaryDirectory(prefix='interfaces-' + mode + '-', dir=OUT) as directory:
+        command = [str(interfaces), loader, directory, mode]
+        run = subprocess.run(command, capture_output=True, text=True, timeout=120)
+        log = OUT / ('interfaces-' + mode + '.log')
+        log.write_text(run.stdout + run.stderr)
+        if run.returncode or not any(line.startswith('PASS:') for line in run.stdout.splitlines()):
+            sys.exit('Metal interfaces %s failed; see %s' % (mode, log))
+        print(run.stdout, end='')
 # Qualify compatible original UI descriptors, actual repeated blur pixels and
 # independent cold archive versus driver-cache provisioning.
 if QUARTZCORE.is_file():
     subprocess.run([sys.executable, ROOT / 'scripts/check-quartzcore-blur-host.py'], check=True,
                    env=dict(os.environ, NMB_HOST_LOADER=loader), timeout=660)
+subprocess.run([sys.executable, ROOT / 'scripts/check-wallpaper-freeze-host.py', '--reuse-bridge'], check=True)
 # A nil resource in a blit call fails the command buffer; it must not raise (an exception escaping the plugin's worker thread aborted SpringBoard).
 nilargs = OUT / 'nil_args_host'
 subprocess.run(['xcrun', 'clang++', *flags, KIT / 'NativeBridgeMetalFrontend.mm', KIT / 'bridge/nil_args_host.mm',
