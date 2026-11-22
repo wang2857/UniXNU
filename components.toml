@@ -510,3 +510,22 @@ runtime_identifiers = ["ShengPreflight"]
 build_stage = "firmware"
 build = []
 outputs = []
+
+[[component]]
+id = "DitingPlatform24"
+kind = "kit"
+function = "Diting SM8475 platform aggregate, including A730, QCA6490, storage, input and power"
+scope = "device"
+repository = "https://github.com/nagatoquin33/UniXNU-diting.git"
+revision = "18207631710db3805dc8ee569cc95b4ad9488057"
+path = "kits/DitingPlatform24"
+hardware = ["SM8475", "Adreno730", "QCA6490", "CS35L41", "Goodix Berlin-D"]
+os_abi = ["ipados-18.7.10-22H374"]
+board_dependencies = ["Diting Android DT", "Diting modem/vendor firmware", "22H374 kernelcache and dyld cache"]
+verified_devices = []
+dependencies = []
+source_files = ["drivers/ArmCpu/ArmCpu.cpp", "drivers/DitingWifi/DitingWifiPlatform.cpp", "drivers/DitingPower/DitingAudio.cpp"]
+runtime_identifiers = ["NativeAdreno", "DitingAudioService", "DitingAudioUserClient", "DitingUfsBlock", "DarwinBoot24.efi"]
+build_stage = "kernel"
+build = ["{component}/build-with-runtime.py", "--artifact-dir", "{out}/kernel", "--tree", "{tree}"]
+outputs = ["kernel/mach.development.diting"]
